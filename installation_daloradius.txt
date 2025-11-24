@@ -1,0 +1,157 @@
+#!/bin/bash
+
+# =============================================================================
+# SCRIPT D'INSTALLATION FINAL (FREERADIUS + DALORADIUS) v6 (Fiable)
+#
+# Ce script intègre tous les correctifs découverts lors de notre
+# session de débogage.
+#
+# 1. Nettoie les anciennes BDD/utilisateurs.
+# 2. Utilise la Release 1.3 de daloRADIUS.
+# 3. Utilise les bons chemins de fichiers (SQL et .conf.php).
+# 4. Corrige le bug "sqlippool" dans FreeRADIUS.
+# =============================================================================
+
+# --- Arrêter le script en cas d'erreur ---
+set -e
+
+# --- (1) VARIABLES DE CONFIGURATION ---
+MDP_DATABASE="MotDePasseSuperSolide123!"
+DB_NOM="radius"
+DB_USER="radius"
+DALO_VERSION="1.3"
+DALO_WEB_PATH="/var/www/html/daloradius"
+
+echo "======================================================="
+echo " Démarrage de l'installation de FreeRADIUS + daloRADIUS"
+echo " (Version 6 - Finale et Fiable)"
+echo "======================================================="
+
+# --- (2) Mise à jour du système et installation des paquets ---
+echo "[ÉTAPE 1/8] Installation des paquets..."
+sudo apt update
+sudo apt install -y apache2 mariadb-server \
+                    php libapache2-mod-php php-gd php-common php-mysql php-pear php-db \
+                    freeradius freeradius-mysql freeradius-utils \
+                    wget unzip
+
+# --- (3) Configuration de la base de données MariaDB (Robuste) ---
+echo "[ÉTAPE 2/8] Configuration de la base de données MariaDB..."
+sudo systemctl start mariadb
+
+# On supprime d'abord au cas où (ignore les erreurs si ça n'existe pas)
+echo "Nettoyage de l'ancienne base de données et de l'utilisateur..."
+sudo mysql -u root -e "DROP USER IF EXISTS '${DB_USER}'@'localhost';"
+sudo mysql -u root -e "DROP DATABASE IF EXISTS ${DB_NOM};"
+
+# On crée (maintenant proprement)
+echo "Création de la nouvelle base de données et de l'utilisateur..."
+sudo mysql -u root -e "CREATE DATABASE ${DB_NOM};"
+sudo mysql -u root -e "CREATE USER '${DB_USER}'@'localhost' IDENTIFIED BY '${MDP_DATABASE}';"
+sudo mysql -u root -e "GRANT ALL PRIVILEGES ON ${DB_NOM}.* TO '${DB_USER}'@'localhost';"
+sudo mysql -u root -e "FLUSH PRIVILEGES;"
+
+# --- (4) Importation du schéma SQL de FreeRADIUS ---
+echo "[ÉTAPE 3/8] Importation du schéma SQL de FreeRADIUS..."
+sudo mysql -u root ${DB_NOM} < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
+
+# --- (5) Configuration de FreeRADIUS (le "pont" SQL) ---
+echo "[ÉTAPE 4/8] Configuration du module SQL de FreeRADIUS..."
+CONFIG_SQL="/etc/freeradius/3.0/mods-available/sql"
+
+sudo sed -i "s/^\s*#\s*driver = .*/\tdriver = \"rlm_sql_mysql\"/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*#\s*dialect = .*/\tdialect = \"mysql\"/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*server = .*/\tserver = \"localhost\"/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*port = .*/\tport = 3306/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*login = .*/\tlogin = \"${DB_USER}\"/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*password = .*/\tpassword = \"${MDP_DATABASE}\"/" ${CONFIG_SQL}
+sudo sed -i "s/^\s*radius_db = .*/\tradius_db = \"${DB_NOM}\"/" ${CONFIG_SQL}
+
+sudo ln -sf /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-enabled/sql
+sudo chgrp freerad /etc/freeradius/3.0/mods-available/sql
+sudo chmod g+r /etc/freeradius/3.0/mods-available/sql
+
+# --- (6) Configuration du site FreeRADIUS (Correction "sqlippool") ---
+echo "[ÉTAPE 5/8] Correction du bug 'sqlippool' de FreeRADIUS..."
+CONFIG_DEFAULT="/etc/freeradius/3.0/sites-available/default"
+
+# Activer SQL dans les sections
+sudo sed -i "s/^\s*#\s*sql/\t\tsql/" ${CONFIG_DEFAULT}
+sudo sed -i "s/^\s*#\s*sql/\t\tsql/" ${CONFIG_DEFAULT} # (On le fait 2 fois pour les sections authorize et accounting)
+
+# --- CORRECTION FINALE ---
+# On commente les DEUX appels au module "sqlippool" qui faisaient planter le service
+sudo sed -i "s/^\s*sqlippool/#&/" ${CONFIG_DEFAULT}
+sudo sed -i "s/^\s*sqlippool/#&/" ${CONFIG_DEFAULT}
+# --- FIN CORRECTION ---
+
+
+# --- (7) Installation de daloRADIUS (Robuste) ---
+echo "[ÉTAPE 6/8] Téléchargement et installation de daloRADIUS ${DALO_VERSION}..."
+cd /tmp
+
+# Nettoyage des anciens artefacts
+echo "Nettoyage des anciens téléchargements et installations web..."
+sudo rm -f ${DALO_VERSION}.zip
+sudo rm -rf daloradius-${DALO_VERSION}
+sudo rm -rf ${DALO_WEB_PATH} # Supprimer le dossier web incomplet
+
+# Téléchargement et dézippage
+echo "Téléchargement de la version ${DALO_VERSION}..."
+wget -q https://github.com/lirantal/daloradius/archive/refs/tags/${DALO_VERSION}.zip
+unzip -q ${DALO_VERSION}.zip
+
+# Déplacement (plus fiable que 'cp -r *')
+echo "Installation des fichiers web..."
+sudo mv daloradius-${DALO_VERSION} ${DALO_WEB_PATH}
+
+# Importer les schémas SQL spécifiques à daloRADIUS (le bon fichier)
+echo "Importation des schémas SQL de daloRADIUS..."
+sudo mysql -u root ${DB_NOM} < ${DALO_WEB_PATH}/contrib/db/mysql-daloradius.sql
+
+
+# --- (8) Configuration de daloRADIUS (l'IHM Web) ---
+echo "[ÉTAPE 7/8] Configuration de l'IHM web daloRADIUS..."
+
+# Les BONS chemins de fichiers pour la v1.3
+SOURCE_FILE="${DALO_WEB_PATH}/library/daloradius.conf.php.sample"
+DEST_FILE="${DALO_WEB_PATH}/library/daloradius.conf.php"
+
+# On crée le fichier de conf au bon endroit
+sudo cp ${SOURCE_FILE} ${DEST_FILE}
+
+# On modifie le fichier de destination avec sed
+echo "Paramétrage de la connexion à la base de données..."
+sudo sed -i "s/\$configValues\['CONFIG_DB_HOST'\] = '.*';/\$configValues\['CONFIG_DB_HOST'\] = 'localhost';/" ${DEST_FILE}
+sudo sed -i "s/\$configValues\['CONFIG_DB_USER'\] = '.*';/\$configValues['CONFIG_DB_USER'\] = '${DB_USER}';/" ${DEST_FILE}
+sudo sed -i "s/\$configValues\['CONFIG_DB_PASS'\] = '.*';/\$configValues['CONFIG_DB_PASS'\] = '${MDP_DATABASE}';/" ${DEST_FILE}
+sudo sed -i "s/\$configValues\['CONFIG_DB_NAME'\] = '.*';/\$configValues['CONFIG_DB_NAME'\] = '${DB_NOM}';/" ${DEST_FILE}
+
+# --- (9) Configuration finale d'Apache2 et permissions ---
+echo "[ÉTAPE 8/8] Configuration d'Apache et des permissions..."
+sudo sed -i "s/DirectoryIndex index.html/DirectoryIndex index.php index.html/" /etc/apache2/mods-available/dir.conf
+sudo chown -R www-data:www-data ${DALO_WEB_PATH}/
+
+# --- (10) Redémarrage des services ---
+echo "[TERMINÉ] Redémarrage de tous les services..."
+sudo systemctl restart mariadb
+sudo systemctl restart freeradius
+sudo systemctl restart apache2
+
+# Vérification finale
+echo "Vérification du statut des services..."
+sudo systemctl status freeradius --no-pager
+sudo systemctl status apache2 --no-pager
+
+echo "====================================================================="
+echo " ✅ Installation terminée !"
+echo ""
+echo "   ➡️ Accédez à l'IHM daloRADIUS ici :"
+echo "   http://localhost/daloradius/"
+echo ""
+echo "   Identifiants par défaut :"
+echo "   Utilisateur : administrator"
+echo "   Mot de passe  : radius"
+echo ""
+echo "   Mot de passe de la BDD (pour info) : ${MDP_DATABASE}"
+echo "====================================================================="
